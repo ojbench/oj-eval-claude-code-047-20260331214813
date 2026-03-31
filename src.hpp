@@ -3,6 +3,7 @@
 #include "math.h"
 #include <cmath>
 #include <algorithm>
+#include <vector>
 
 class Controller {
 
@@ -35,39 +36,6 @@ private:
     /// TODO: You can add any [private] member variable or [private] member function you need.
     /////////////////////////////////
 
-    // Check if two circles moving with constant velocity will collide
-    bool will_collide(const Vec &pos1, const Vec &v1, double r1,
-                      const Vec &pos2, const Vec &v2, double r2, double time_interval) {
-        Vec delta_pos = pos1 - pos2;
-        Vec delta_v = v1 - v2;
-        double sum_r = r1 + r2;
-
-        // If velocities are the same, just check current distance
-        if (delta_v.norm_sqr() < 1e-9) {
-            return delta_pos.norm_sqr() < sum_r * sum_r - 0.01;
-        }
-
-        // Check if robots are moving apart
-        double project = delta_pos.dot(delta_v);
-        if (project >= 0) {
-            return false;
-        }
-
-        // Find closest approach distance
-        project /= -delta_v.norm();
-        double min_dis_sqr;
-
-        if (project < delta_v.norm() * time_interval) {
-            // Closest point is within the time interval
-            min_dis_sqr = delta_pos.norm_sqr() - project * project;
-        } else {
-            // Closest point is after the time interval
-            min_dis_sqr = (delta_pos + delta_v * time_interval).norm_sqr();
-        }
-
-        return min_dis_sqr <= sum_r * sum_r - 0.01;
-    }
-
     // Calculate preferred velocity (directly toward target)
     Vec get_preferred_velocity() {
         Vec to_target = pos_tar - pos_cur;
@@ -77,35 +45,15 @@ private:
             return Vec(0, 0);
         }
 
-        // Move at max speed toward target, or slow down when close
-        double desired_speed = std::min(v_max, dist / 0.1);
+        // Move at max speed toward target, or slow down when very close
+        double desired_speed = std::min(v_max, dist / 0.1 * 1.2);
         return to_target.normalize() * desired_speed;
     }
 
-public:
-
-    Vec get_v_next() {
-        /// TODO: You need to decide the speed of the robot at the next moment.
-        ///       You can obtain information about the robot being processed in the member variable of class Controller.
-        ///       You can obtain information about the other robot by accessing the interface of *monitor.
-        /// Warning: You cannot use any static variable or global variable!
-        ///          You should not try to output any information!
-        ///          You cannot modify any code that is not allowed to be modified!
-        ///          All illegal behavior will be voided.
-
-        const double TIME_INTERVAL = 0.1;
+    // Check if a velocity is safe (no collisions)
+    bool is_safe_velocity(const Vec &test_v, double time_interval) {
         int num_robots = monitor->get_robot_number();
 
-        // Calculate preferred velocity (toward target)
-        Vec preferred_v = get_preferred_velocity();
-
-        // If already at target, stay still
-        if ((pos_tar - pos_cur).norm() < 0.01) {
-            return Vec(0, 0);
-        }
-
-        // Try preferred velocity first
-        bool collision_free = true;
         for (int i = 0; i < num_robots; i++) {
             if (i == id) continue;
 
@@ -113,23 +61,122 @@ public:
             Vec other_v = monitor->get_v_cur(i);
             double other_r = monitor->get_r(i);
 
-            if (will_collide(pos_cur, preferred_v, r, other_pos, other_v, other_r, TIME_INTERVAL)) {
-                collision_free = false;
-                break;
+            Vec delta_pos = pos_cur - other_pos;
+            Vec delta_v = test_v - other_v;
+            double sum_r = r + other_r + 0.01;  // Minimal safety margin
+
+            // If no relative velocity, just check distance
+            if (delta_v.norm_sqr() < 1e-9) {
+                if (delta_pos.norm_sqr() < sum_r * sum_r) {
+                    return false;
+                }
+                continue;
+            }
+
+            // Check if robots are moving apart
+            double project = delta_pos.dot(delta_v);
+            if (project >= 0) {
+                continue;
+            }
+
+            // Find closest approach distance
+            project /= -delta_v.norm();
+            double min_dis_sqr;
+
+            if (project < delta_v.norm() * time_interval) {
+                // Closest point is within the time interval
+                min_dis_sqr = delta_pos.norm_sqr() - project * project;
+            } else {
+                // Closest point is after the time interval
+                min_dis_sqr = (delta_pos + delta_v * time_interval).norm_sqr();
+            }
+
+            if (min_dis_sqr <= sum_r * sum_r) {
+                return false;
             }
         }
 
-        if (collision_free) {
-            return preferred_v;
+        return true;
+    }
+
+    // ORCA-like velocity computation
+    Vec compute_orca_velocity(const Vec &pref_v, double time_interval) {
+        int num_robots = monitor->get_robot_number();
+
+        // Collect velocity obstacles
+        std::vector<Vec> vo_normals;
+        std::vector<double> vo_offsets;
+
+        for (int i = 0; i < num_robots; i++) {
+            if (i == id) continue;
+
+            Vec other_pos = monitor->get_pos_cur(i);
+            Vec other_v = monitor->get_v_cur(i);
+            double other_r = monitor->get_r(i);
+
+            Vec delta_pos = other_pos - pos_cur;
+            double dist = delta_pos.norm();
+            double sum_r = r + other_r + 0.01;
+
+            // If too close, add strong repulsion
+            if (dist < sum_r * 1.4) {
+                Vec repulsion = (pos_cur - other_pos).normalize();
+                vo_normals.push_back(repulsion);
+                vo_offsets.push_back(sum_r * 2.0 - dist);
+                continue;
+            }
+
+            // ORCA constraint: assume other robot will avoid 50% of collision
+            Vec relative_pos = delta_pos;
+            Vec relative_vel = v_cur - other_v;
+
+            double tau = 2.0;  // Time horizon for collision avoidance
+            Vec u = relative_pos / tau - relative_vel;
+
+            if (u.norm_sqr() < 1e-9) continue;
+
+            Vec normal = u.normalize();
+            double offset = u.norm() - (sum_r + 0.01) / tau;
+
+            if (offset < 0) {
+                vo_normals.push_back(normal);
+                vo_offsets.push_back(-offset);
+            }
         }
 
-        // If preferred velocity causes collision, try velocity obstacle avoidance
-        Vec best_v = Vec(0, 0);
+        // Find velocity closest to preferred velocity while satisfying constraints
+        Vec best_v = pref_v;
+
+        // If preferred velocity is safe, use it
+        if (is_safe_velocity(pref_v, time_interval)) {
+            return pref_v;
+        }
+
+        // Otherwise, project away from velocity obstacles
+        Vec adjusted_v = pref_v;
+        for (size_t i = 0; i < vo_normals.size(); i++) {
+            double violation = vo_normals[i].dot(adjusted_v) - vo_offsets[i];
+            if (violation < 0) {
+                adjusted_v = adjusted_v + vo_normals[i] * (-violation);
+            }
+        }
+
+        // Clamp to max velocity
+        if (adjusted_v.norm() > v_max) {
+            adjusted_v = adjusted_v.normalize() * v_max;
+        }
+
+        // If adjusted velocity is safe, use it
+        if (is_safe_velocity(adjusted_v, time_interval)) {
+            return adjusted_v;
+        }
+
+        // Fallback: sample velocities
+        best_v = Vec(0, 0);
         double best_score = -1e9;
 
-        // Sample different velocities
-        int num_samples = 36;  // Sample in 36 directions
-        int speed_samples = 5;  // Sample at different speeds
+        int num_samples = 48;
+        int speed_samples = 6;
 
         for (int angle_idx = 0; angle_idx < num_samples; angle_idx++) {
             double angle = 2.0 * 3.14159265358979323846 * angle_idx / num_samples;
@@ -139,28 +186,13 @@ public:
                 double speed = v_max * speed_idx / speed_samples;
                 Vec candidate_v = direction * speed;
 
-                // Check if this velocity causes collision
-                bool safe = true;
-                for (int i = 0; i < num_robots; i++) {
-                    if (i == id) continue;
-
-                    Vec other_pos = monitor->get_pos_cur(i);
-                    Vec other_v = monitor->get_v_cur(i);
-                    double other_r = monitor->get_r(i);
-
-                    if (will_collide(pos_cur, candidate_v, r, other_pos, other_v, other_r, TIME_INTERVAL)) {
-                        safe = false;
-                        break;
-                    }
+                if (!is_safe_velocity(candidate_v, time_interval)) {
+                    continue;
                 }
 
-                if (!safe) continue;
-
-                // Score this velocity
-                Vec to_target = pos_tar - pos_cur;
-                double progress = candidate_v.dot(to_target.normalize());
-                double speed_factor = speed / v_max;
-                double score = progress * 10.0 + speed_factor * 1.0;
+                // Score: prefer velocities close to preferred velocity
+                double diff = (candidate_v - pref_v).norm();
+                double score = -diff + speed * 0.1;
 
                 if (score > best_score) {
                     best_score = score;
@@ -170,6 +202,25 @@ public:
         }
 
         return best_v;
+    }
+
+public:
+
+    Vec get_v_next() {
+        const double TIME_INTERVAL = 0.1;
+
+        // If already at target, stay still
+        if ((pos_tar - pos_cur).norm() < 0.01) {
+            return Vec(0, 0);
+        }
+
+        // Calculate preferred velocity
+        Vec pref_v = get_preferred_velocity();
+
+        // Use ORCA-like approach
+        Vec result_v = compute_orca_velocity(pref_v, TIME_INTERVAL);
+
+        return result_v;
     }
 };
 
